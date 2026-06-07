@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/env.sh"
 export PATH=$PATH:/usr/local/go/bin:$HOME/go/bin
 
-mkdir -p "$GO_DIR/perop" "$GO_DIR/clientbulk" "$GO_DIR/srvmon"
+mkdir -p "$GO_DIR/perop" "$GO_DIR/clientbulk" "$GO_DIR/srvmon" "$GO_DIR/hotdoc"
 cd "$GO_DIR"
 [[ -f go.mod ]] || go mod init rwbbench
 
@@ -191,6 +191,7 @@ import (
 	"os"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -228,6 +229,7 @@ func main() {
 	var wg sync.WaitGroup
 	latCh := make([][]float64, sessions); committed := make([]int, sessions)
 	errs := make([]int, sessions); retries := make([]int, sessions)
+	tpsBuckets := make([]int64, durSec+30)
 	start := time.Now(); deadline := start.Add(time.Duration(durSec)*time.Second)
 
 	for i := 0; i < sessions; i++ {
@@ -271,6 +273,8 @@ func main() {
 				if attempts > 1 { retries[id] += attempts - 1 }
 				wall := float64(time.Since(t0).Microseconds())/1000.0
 				if txErr == errInsufficient { } else if txErr != nil { errs[id]++ } else {
+					sec := int(time.Since(start).Seconds())
+					if sec >= 0 && sec < len(tpsBuckets) { atomic.AddInt64(&tpsBuckets[sec], 1) }
 					if time.Since(start).Seconds() > float64(warmupSec) { local = append(local, wall); committed[id]++ }
 				}
 				if rem := cycle - time.Since(t0); rem > 0 { time.Sleep(time.Duration(float64(rem)*(0.8+0.4*r.Float64()))) }
@@ -279,7 +283,20 @@ func main() {
 		}(i)
 	}
 	wg.Wait()
+	writeTPSCSV(tpsBuckets)
 	report("PER-OP", latCh, committed, errs, retries, time.Since(start).Seconds(), float64(warmupSec))
+}
+
+// writeTPSCSV — when TPS_CSV_OUT env is set, writes per-second commit counts.
+// Used by scenario scripts to plot the dip-and-recovery curve (stepdown bench).
+func writeTPSCSV(tps []int64) {
+	p := os.Getenv("TPS_CSV_OUT")
+	if p == "" { return }
+	f, err := os.Create(p)
+	if err != nil { fmt.Fprintln(os.Stderr, "TPS_CSV_OUT err:", err); return }
+	defer f.Close()
+	fmt.Fprintln(f, "second,commits")
+	for i, n := range tps { fmt.Fprintf(f, "%d,%d\n", i, n) }
 }
 
 func report(name string, latCh [][]float64, committed, errs, retries []int, elapsed, warmup float64) {
@@ -314,6 +331,7 @@ import (
 	"os"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -347,6 +365,7 @@ func main() {
 	var wg sync.WaitGroup
 	latCh := make([][]float64, sessions); committed := make([]int, sessions)
 	errs := make([]int, sessions); retries := make([]int, sessions)
+	tpsBuckets := make([]int64, durSec+30)
 	start := time.Now(); deadline := start.Add(time.Duration(durSec)*time.Second)
 
 	for i := 0; i < sessions; i++ {
@@ -400,6 +419,8 @@ func main() {
 				if attempts > 1 { retries[id] += attempts - 1 }
 				wall := float64(time.Since(t0).Microseconds())/1000.0
 				if txErr == errInsufficient { } else if txErr != nil { errs[id]++ } else {
+					sec := int(time.Since(start).Seconds())
+					if sec >= 0 && sec < len(tpsBuckets) { atomic.AddInt64(&tpsBuckets[sec], 1) }
 					if time.Since(start).Seconds() > float64(warmupSec) { local = append(local, wall); committed[id]++ }
 				}
 				if rem := cycle - time.Since(t0); rem > 0 { time.Sleep(time.Duration(float64(rem)*(0.8+0.4*r.Float64()))) }
@@ -408,7 +429,20 @@ func main() {
 		}(i)
 	}
 	wg.Wait()
+	writeTPSCSV(tpsBuckets)
 	report("CLIENT-BULK", latCh, committed, errs, retries, time.Since(start).Seconds(), float64(warmupSec))
+}
+
+// writeTPSCSV — when TPS_CSV_OUT env is set, writes per-second commit counts.
+// Used by scenario scripts to plot the dip-and-recovery curve (stepdown bench).
+func writeTPSCSV(tps []int64) {
+	p := os.Getenv("TPS_CSV_OUT")
+	if p == "" { return }
+	f, err := os.Create(p)
+	if err != nil { fmt.Fprintln(os.Stderr, "TPS_CSV_OUT err:", err); return }
+	defer f.Close()
+	fmt.Fprintln(f, "second,commits")
+	for i, n := range tps { fmt.Fprintf(f, "%d,%d\n", i, n) }
 }
 
 func report(name string, latCh [][]float64, committed, errs, retries []int, elapsed, warmup float64) {
@@ -427,6 +461,154 @@ func report(name string, latCh [][]float64, committed, errs, retries []int, elap
 			pct(50), pct(95), pct(99), pct(99.9), all[len(all)-1])
 		pass := pct(99) <= pLatencyMs
 		fmt.Printf("  PASS (p99<=20ms)? %v\n", pass)
+	}
+}
+EOF
+
+# ============================ HOTDOC VARIANT — fixed cardId, contention storm ============================
+# All goroutines target the same cardId (HOT_CARD_ID env, defaults to CARD-0000000001).
+# Optionally also fix the merchant id via HOT_MERCHANT_ID (default: random per txn).
+# No target_tps cycling — goroutines fire as fast as the cluster lets them, which IS the point.
+# Used by scenarios/hotdoc_with_baseline.sh to demonstrate Shape B (hot-card burst layered on
+# a normal 5K-TPS perop workload).
+cat > hotdoc/main.go <<EOF
+package main
+
+import (
+	"context"
+	"encoding/binary"
+	"fmt"
+	"math/rand"
+	"os"
+	"sort"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
+)
+
+$CONSTS
+
+func main() {
+	if len(os.Args) < 3 { fmt.Println("usage: hotdoc <concurrency> <duration_s>"); os.Exit(1) }
+	var concurrency, durSec int
+	fmt.Sscan(os.Args[1], &concurrency); fmt.Sscan(os.Args[2], &durSec)
+	minPool := envInt("MIN_POOL", 500); maxPool := envInt("MAX_POOL", 1000)
+	warmupSec := envInt("WARMUP_SEC", 5)
+	hotCard := os.Getenv("HOT_CARD_ID"); if hotCard == "" { hotCard = "CARD-0000000001" }
+	hotMerch := os.Getenv("HOT_MERCHANT_ID")  // empty = random merchant
+
+	uri := os.Getenv("MONGO_URI"); ctx := context.Background()
+	cli, err := mongo.Connect(options.Client().ApplyURI(uri).
+		SetMaxPoolSize(uint64(maxPool)).SetMinPoolSize(uint64(minPool)))
+	if err != nil { panic(err) }
+	defer cli.Disconnect(ctx)
+	if err := cli.Ping(ctx, nil); err != nil { panic(err) }
+
+	db := cli.Database(dbName)
+	cards := db.Collection("cards"); ledger := db.Collection("txn_ledger")
+	cardVel := db.Collection("cardholder_velocity"); merchVel := db.Collection("merchant_velocity")
+	txnOpts := options.Transaction().SetWriteConcern(writeconcern.Majority())
+	upsertOpt := options.UpdateOne().SetUpsert(true)
+
+	var wg sync.WaitGroup
+	latCh := make([][]float64, concurrency); committed := make([]int, concurrency)
+	errs := make([]int, concurrency); retries := make([]int, concurrency)
+	tpsBuckets := make([]int64, durSec+30)
+	start := time.Now(); deadline := start.Add(time.Duration(durSec)*time.Second)
+
+	fmt.Printf("HOTDOC starting — cardId=%s  concurrency=%d  duration=%ds\n", hotCard, concurrency, durSec)
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			r := rand.New(rand.NewSource(time.Now().UnixNano()+int64(id)))
+			sess, err := cli.StartSession(); if err != nil { errs[id]++; return }
+			defer sess.EndSession(ctx)
+			local := make([]float64, 0, 4096)
+			for time.Now().Before(deadline) {
+				var mIdx int
+				var midStr string
+				if hotMerch != "" {
+					midStr = hotMerch
+				} else {
+					mIdx = pickMerchant(r) + 1
+					midStr = merchID(mIdx)
+				}
+				amount := int64(r.Intn(txnAmountMax-txnAmountMin+1) + txnAmountMin)
+				cb := r.Intn(merchBuckets)
+				now := time.Now(); hb := hourBucket(now); dbStr := dayBucket(now)
+				cvID := bson.D{{Key: "cardId", Value: hotCard}, {Key: "bucket", Value: dbStr}}
+				mvID := bson.D{{Key: "mid", Value: midStr}, {Key: "bucket", Value: hb}, {Key: "cb", Value: cb}}
+				attempts := 0
+				t0 := time.Now()
+				txnCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				_, txErr := sess.WithTransaction(txnCtx, func(sc context.Context) (interface{}, error) {
+					attempts++
+					res, e := cards.UpdateOne(sc,
+						bson.M{"_id": hotCard, "status": "ACTIVE", "balance": bson.M{"\$gte": amount}},
+						bson.M{"\$inc": bson.M{"balance": -amount, "version": 1}, "\$set": bson.M{"last_updated": now, "activity.last_txn_at": now}})
+					if e != nil { return nil, e }
+					if res.MatchedCount == 0 { return nil, errInsufficient }
+					if _, e = ledger.InsertOne(sc, buildLedgerDoc(hotCard, midStr, amount, now, r)); e != nil { return nil, e }
+					if _, e = cardVel.UpdateOne(sc, bson.M{"_id": cvID},
+						bson.M{"\$inc": bson.M{"count": 1, "sum": amount}, "\$set": bson.M{"updatedAt": now}},
+						upsertOpt); e != nil { return nil, e }
+					if _, e = merchVel.UpdateOne(sc, bson.M{"_id": mvID},
+						bson.M{"\$inc": bson.M{"count": 1, "sum": amount}, "\$set": bson.M{"updatedAt": now}},
+						upsertOpt); e != nil { return nil, e }
+					return nil, nil
+				}, txnOpts)
+				cancel()
+				if attempts > 1 { retries[id] += attempts - 1 }
+				wall := float64(time.Since(t0).Microseconds())/1000.0
+				if txErr == errInsufficient { } else if txErr != nil { errs[id]++ } else {
+					sec := int(time.Since(start).Seconds())
+					if sec >= 0 && sec < len(tpsBuckets) { atomic.AddInt64(&tpsBuckets[sec], 1) }
+					if time.Since(start).Seconds() > float64(warmupSec) { local = append(local, wall); committed[id]++ }
+				}
+				// No cycle delay — hammer as fast as the cluster admits.
+			}
+			latCh[id] = local
+		}(i)
+	}
+	wg.Wait()
+	writeTPSCSV(tpsBuckets)
+	report("HOTDOC", latCh, committed, errs, retries, time.Since(start).Seconds(), float64(warmupSec))
+}
+
+// writeTPSCSV — when TPS_CSV_OUT env is set, writes per-second commit counts.
+func writeTPSCSV(tps []int64) {
+	p := os.Getenv("TPS_CSV_OUT")
+	if p == "" { return }
+	f, err := os.Create(p)
+	if err != nil { fmt.Fprintln(os.Stderr, "TPS_CSV_OUT err:", err); return }
+	defer f.Close()
+	fmt.Fprintln(f, "second,commits")
+	for i, n := range tps { fmt.Fprintf(f, "%d,%d\n", i, n) }
+}
+
+// report — same shape as perop/clientbulk so output is parseable by run_battery / scenario scripts.
+// Note: hotdoc has no TPS target so the PASS check uses latency only.
+func report(name string, latCh [][]float64, committed, errs, retries []int, elapsed, warmup float64) {
+	var all []float64; tc, te, tr := 0, 0, 0
+	for i := range latCh { all = append(all, latCh[i]...); tc += committed[i]; te += errs[i]; tr += retries[i] }
+	sort.Float64s(all)
+	win := elapsed - warmup; if win <= 0 { win = elapsed }
+	pct := func(p float64) float64 { if len(all)==0 {return 0}; idx:=int(p/100*float64(len(all))); if idx>=len(all){idx=len(all)-1}; return all[idx] }
+	fmt.Println("==================================================")
+	fmt.Printf("GO RWB-%s (%.1fs total, %.1fs measured)\n", name, elapsed, win)
+	fmt.Println("==================================================")
+	fmt.Printf("  committed (post-warmup): %d  windowed TPS: %.0f  errors: %d\n", tc, float64(tc)/win, te)
+	if tc > 0 { fmt.Printf("  retries: %d  (%.2f%% of committed)\n", tr, 100.0*float64(tr)/float64(tc)) }
+	if len(all) > 0 {
+		fmt.Printf("  median %.2f  p95 %.2f  p99 %.2f  p99.9 %.2f  max %.2f\n",
+			pct(50), pct(95), pct(99), pct(99.9), all[len(all)-1])
 	}
 }
 EOF
@@ -521,10 +703,11 @@ func main() {
 }
 EOF
 
-echo "=== go mod tidy + build all three binaries ==="
+echo "=== go mod tidy + build all four binaries ==="
 go mod tidy
 go build -o perop_bin ./perop && echo "perop_bin OK"
 go build -o clientbulk_bin ./clientbulk && echo "clientbulk_bin OK"
+go build -o hotdoc_bin ./hotdoc && echo "hotdoc_bin OK"
 go build -o srvmon_bin ./srvmon && echo "srvmon_bin OK"
-ls -la perop_bin clientbulk_bin srvmon_bin
-echo "=== Build done. Next: ./run_perop.sh or ./run_clientbulk.sh ==="
+ls -la perop_bin clientbulk_bin hotdoc_bin srvmon_bin
+echo "=== Build done. Next: ./run_perop.sh, ./run_clientbulk.sh, or ./scenarios/*.sh ==="
