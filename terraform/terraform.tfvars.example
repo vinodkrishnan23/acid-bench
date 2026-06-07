@@ -1,0 +1,52 @@
+# Copy to terraform.tfvars (gitignored). Optionally put secrets in gitignored aws.auto.tfvars:
+#   cp terraform.tfvars.example terraform.tfvars
+#
+# SSO (recommended):
+#   aws sso login --profile <your-aws-profile>
+# Then set aws_profile below.
+
+aws_region        = "ap-south-1"
+availability_zone = "ap-south-1a"
+vpc_id            = "vpc-xxxxxxxx"
+
+extra_tags = {
+  purpose     = "opportunity"
+  "expire-on" = "2027-01-01"
+  owner       = "<your-owner-tag>"
+}
+
+# --- AWS authentication (pick one approach) ---
+aws_profile = "<your-aws-profile>"
+
+# Optional static / temporary keys (omit when using SSO profile above):
+# aws_access_key_id     = "AKIAxxxxxxxxxxxxxxxx"
+# aws_secret_access_key = "your-secret-access-key"
+# aws_session_token     = "..." # required for temporary credentials
+
+# --- Network: single public subnet (ap-south-1a) for runner + 3 MongoDB nodes ---
+public_subnet_id = "subnet-xxxxxxxx" # must have 0.0.0.0/0 → igw-* or nat-*
+
+mongodb_associate_public_ip = true   # true when subnet uses IGW (typical public subnet)
+mongodb_install_via_runner  = false
+skip_subnet_egress_check    = false
+
+# Stable private IPs: host indices in public_subnet CIDR (must be unused).
+# Check: aws ec2 describe-network-interfaces --filters Name=subnet-id,Values=<subnet-id>
+# Example for 10.0.0.0/20: [200, 201, 202] -> 10.0.0.200-202
+mongodb_private_ip_hostnums = [200, 201, 202]
+
+# --- Compute ---
+ami_id      = "ami-xxxxxxxx" # Amazon Linux 2023 in ap-south-1
+name_prefix = "fss-q1"
+
+# --- SSH: PEM on laptop; register public key via Terraform (recommended) ---
+# ssh-keygen -y -f ~/.ssh/your-key.pem > ~/.ssh/your-key.pub
+ssh_public_key_file = "/Users/you/.ssh/your-key.pub"
+private_key_path    = "/Users/you/.ssh/your-key.pem"
+
+# --- MongoDB ---
+mongo_admin_user     = "admin"
+mongo_admin_password = "CHANGE_ME"
+
+# --- Runner SSH ---
+ssh_cidrs = ["203.0.113.10/32"] # your public IP /32 — curl -4 ifconfig.me

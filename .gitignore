@@ -1,0 +1,42 @@
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/terraform.tfvars
+terraform/*.auto.tfvars
+terraform/*.tfstate*
+terraform/crash.log
+terraform/crash.*.log
+
+# Benchmark output / heavy data
+benchmark/results/*.json
+!benchmark/results/.gitkeep
+benchmark/bulkwrite/node_modules/
+benchmark/bulkwrite/package-lock.json
+data-generation/seed_manifest.json
+realworldbenchmark/ftdc/
+realworldbenchmark/results/
+realworldbenchmark/goharness/
+realworldbenchmark/*.log
+realworldbenchmark/.ledger_seed_manifest.json
+
+# Secrets / personal
+*.pem
+*.key
+*.crt
+.env
+.envrc
+# Accidentally-saved SSH private keys (e.g. from `ssh -i ec2-user@host ...` typos)
+ec2-user@*
+ubuntu@*
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+
+# Claude Code local settings (user-specific)
+.claude/settings.local.json
+
+# Python / OS
+__pycache__/
+*.pyc
+.DS_Store
+*.swp
