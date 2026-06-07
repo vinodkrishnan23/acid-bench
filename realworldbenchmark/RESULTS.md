@@ -123,6 +123,57 @@ Distribution: min=7.48, median=7.53, avg=8.38, max=11.71, **stddev=1.86**, range
 
 Battery log: `/tmp/battery_128gb_20260607_132814.log` on runner.
 
+## Scaling study — sustained concurrent load beyond 5K TPS
+
+Same cluster (128 GB nodes, default WT cache, 100M+ ledger) as the headline,
+but pushing past 5K TPS with longer runs (300 s instead of 120 s) to expose
+the breaking point. One run per cell — not a 5/5 battery — so use these to
+locate the wall, not as a final certification.
+
+`./run_perop_scenarios.sh` and `./run_clientbulk_scenarios.sh`
+
+### per-op — passes at 5K, breaks at 6K, melts at 7K
+
+| Users | Target TPS | Duration | Committed | Achieved TPS | p50 | p95 | p99 | p99.9 | Max | Retries | Pass |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 3000 | 5000 | 300 s | 1,449,793 | 4987 | 5.40 | 6.69 | **7.50** | 26.69 | 95.17 | 229 | ✅ |
+| 4000 | 6000 | 300 s | 1,740,810 | 5986 | 5.70 | 7.15 | **23.74** | 757.38 | 1466.22 | 870 | ❌ |
+| 5000 | 7000 | 300 s | 2,025,535 | 6964 | 6.04 | 37.03 | **637.45** | 1196.15 | 2215.03 | 6038 | ❌ |
+
+Per-op makes **four separate round trips** per transaction (card update,
+ledger insert, two velocity upserts). Once primary CPU and the disk path
+fill up at ~6K TPS × 4 ops = 24K op/s, checkpoint flushes start colliding
+with the steady-state write stream and the tail explodes.
+
+### client-bulk — passes at 5K, 6K, AND 7K TPS
+
+| Users | Target TPS | Duration | Committed | Achieved TPS | p50 | p95 | p99 | p99.9 | Max | Retries | Pass |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 3000 | 5000 | 300 s | 1,449,295 | 4985 | 4.82 | 6.04 | **9.34** | 400.94 | 620.78 | 263 | ✅ |
+| 4000 | 6000 | 300 s | 1,741,353 | 5988 | 5.11 | 6.51 | **9.96** | 103.63 | 341.75 | 201 | ✅ |
+| 5000 | 7000 | 300 s | 2,030,192 | 6980 | 5.30 | 6.85 | **16.17** | 408.46 | 813.08 | 497 | ✅ |
+
+client-bulk's single-round-trip transaction collapses 4 writes into one
+`ClientBulkWrite`, so at 7K TPS the cluster does ~7K commands/s on the
+write path instead of ~28K. That's why the same hardware that breaks at
+6K per-op cleanly passes 7K client-bulk.
+
+### The client-bulk vs per-op gap
+
+| Target TPS | per-op p99 | client-bulk p99 | Δ (×) |
+|---|---|---|---|
+| 5000 | 7.50 ms | 9.34 ms | ~1× (similar) |
+| 6000 | 23.74 ms | 9.96 ms | **2.4× better with client-bulk** |
+| 7000 | 637.45 ms | 16.17 ms | **39× better with client-bulk** |
+
+**Customer takeaway**: at the headline 5K TPS both variants pass cleanly. If
+production load is expected to grow beyond 5K, **`ClientBulkWrite` is the
+high-leverage code change** — it gets us past 7K on the same hardware. The
+per-op variant would need either bigger nodes, io2 storage, or sharding to
+reach the same TPS.
+
+---
+
 ## 64 GB battery (preserved baseline)
 
 `SESSIONS=3000 TARGET_TPS=5000 DURATION=120 ./run_battery.sh 5`

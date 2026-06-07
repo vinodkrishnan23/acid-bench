@@ -282,6 +282,19 @@ the 100M ledger:
 > p99 = **7.53 ms**, stddev = **1.86 ms**. The 128 GB upgrade eliminated the WT checkpoint
 > tail without changing storage or workload.
 
+### Scaling beyond 5K TPS (same hardware, 300 s sustained runs)
+
+| Target TPS | per-op p99 | client-bulk p99 |
+|---|---|---|
+| 5000 | 7.50 ms ✅ | 9.34 ms ✅ |
+| 6000 | 23.74 ms ❌ | 9.96 ms ✅ |
+| 7000 | 637 ms ❌ | 16.17 ms ✅ |
+
+client-bulk holds p99 ≤ 20 ms all the way to **7,000 TPS** on the same
+128 GB hardware. per-op caps at 5K. The 4× round-trip reduction in
+`ClientBulkWrite` is the high-leverage code change if the customer expects
+load to grow. Full per-run tables in `realworldbenchmark/RESULTS.md`.
+
 ### Atlas comparison (same RAM class, vastly higher IOPS)
 
 > On Atlas M80_NVMe (128 GiB / 16 vCPU / 360 K write IOPS local NVMe, MongoDB 8.3.3), the
