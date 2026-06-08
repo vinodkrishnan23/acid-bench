@@ -209,6 +209,15 @@ func main() {
 	warmupSec := envInt("WARMUP_SEC", 10)
 	cycle := time.Duration(float64(sessions)/float64(targetTPS)*1000) * time.Millisecond
 
+	// CARD_DIST=zipf draws cardIds from a Zipfian distribution instead of
+	// uniform — simulates production traffic where a few cards see most of
+	// the load. ZIPF_S is the skew parameter (must be > 1; higher = more skew).
+	useZipf := os.Getenv("CARD_DIST") == "zipf"
+	zipfS := 1.1
+	if v := os.Getenv("ZIPF_S"); v != "" { fmt.Sscan(v, &zipfS) }
+	if zipfS <= 1.0 { zipfS = 1.1 }
+	if useZipf { fmt.Printf("CARD_DIST=zipf  ZIPF_S=%.2f\n", zipfS) }
+
 	uri := os.Getenv("MONGO_URI"); ctx := context.Background()
 	cli, err := mongo.Connect(options.Client().ApplyURI(uri).
 		SetMaxPoolSize(uint64(maxPool)).SetMinPoolSize(uint64(minPool)))
@@ -235,12 +244,15 @@ func main() {
 		go func(id int) {
 			defer wg.Done()
 			r := rand.New(rand.NewSource(time.Now().UnixNano()+int64(id)))
+			var z *rand.Zipf
+			if useZipf { z = rand.NewZipf(r, zipfS, 1.0, uint64(numCards-1)) }
 			time.Sleep(time.Duration(int64(cycle)/int64(sessions)*int64(id)))
 			sess, err := cli.StartSession(); if err != nil { errs[id]++; return }
 			defer sess.EndSession(ctx)
 			local := make([]float64, 0, 4096)
 			for time.Now().Before(deadline) {
-				cIdx := r.Intn(numCards) + 1
+				var cIdx int
+				if z != nil { cIdx = int(z.Uint64()) + 1 } else { cIdx = r.Intn(numCards) + 1 }
 				mIdx := pickMerchant(r) + 1
 				amount := int64(r.Intn(txnAmountMax-txnAmountMin+1) + txnAmountMin)
 				cb := r.Intn(merchBuckets)
@@ -332,6 +344,13 @@ func main() {
 	warmupSec := envInt("WARMUP_SEC", 10)
 	cycle := time.Duration(float64(sessions)/float64(targetTPS)*1000) * time.Millisecond
 
+	// CARD_DIST=zipf draws cardIds from a Zipfian distribution; see perop comment.
+	useZipf := os.Getenv("CARD_DIST") == "zipf"
+	zipfS := 1.1
+	if v := os.Getenv("ZIPF_S"); v != "" { fmt.Sscan(v, &zipfS) }
+	if zipfS <= 1.0 { zipfS = 1.1 }
+	if useZipf { fmt.Printf("CARD_DIST=zipf  ZIPF_S=%.2f\n", zipfS) }
+
 	uri := os.Getenv("MONGO_URI"); ctx := context.Background()
 	cli, err := mongo.Connect(options.Client().ApplyURI(uri).
 		SetMaxPoolSize(uint64(maxPool)).SetMinPoolSize(uint64(minPool)))
@@ -354,12 +373,15 @@ func main() {
 		go func(id int) {
 			defer wg.Done()
 			r := rand.New(rand.NewSource(time.Now().UnixNano()+int64(id)))
+			var z *rand.Zipf
+			if useZipf { z = rand.NewZipf(r, zipfS, 1.0, uint64(numCards-1)) }
 			time.Sleep(time.Duration(int64(cycle)/int64(sessions)*int64(id)))
 			sess, err := cli.StartSession(); if err != nil { errs[id]++; return }
 			defer sess.EndSession(ctx)
 			local := make([]float64, 0, 4096)
 			for time.Now().Before(deadline) {
-				cIdx := r.Intn(numCards) + 1
+				var cIdx int
+				if z != nil { cIdx = int(z.Uint64()) + 1 } else { cIdx = r.Intn(numCards) + 1 }
 				mIdx := pickMerchant(r) + 1
 				amount := int64(r.Intn(txnAmountMax-txnAmountMin+1) + txnAmountMin)
 				cb := r.Intn(merchBuckets)

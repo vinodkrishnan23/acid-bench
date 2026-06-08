@@ -174,6 +174,106 @@ reach the same TPS.
 
 ---
 
+## Shape C — Zipfian card distribution (heavy-skew upper bound)
+
+> **Status:** stress / upper-bound experiment, NOT a production-realistic
+> result. Kept in the repo as evidence; deliberately excluded from the
+> customer deck.
+
+Same 128 GB cluster, same 100M+ ledger, same 5K-TPS battery shape — but
+instead of drawing cardIds uniformly across the 1M cards, each goroutine
+draws from a **Zipfian distribution** with skew parameter `s=1.1` (the
+loosest skew Go's `math/rand.NewZipf` supports). 5 runs × 2 variants × 120s.
+
+Build flag (added to `perop` and `clientbulk` binaries on this branch):
+
+```bash
+CARD_DIST=zipf ZIPF_S=1.1 SESSIONS=3000 TARGET_TPS=5000 DURATION=120 \
+  ./run_battery.sh 5
+```
+
+### What `s=1.1` actually means in card-distribution terms
+
+`rand.NewZipf(r, s=1.1, v=1.0, imax=999_999)` produces this concentration
+over 1M cards at 5,000 TPS:
+
+| Rank slice | Share of total traffic | Implied TPS on slice |
+|---|---|---|
+| Top 1 card | **~13.4%** | ~670 TPS on a single document |
+| Top 100 cards | ~27 % | ~1370 TPS |
+| Top 1000 cards | ~67 % | ~3350 TPS |
+| Bottom 999,000 cards | ~33 % | ~1650 TPS combined |
+
+The top card alone is asked to absorb ~670 TPS. Scenario 2 already
+measured a single document's serialization ceiling at ~450–485 TPS under
+MVCC. So this skew is asking ~50 % more than the document can physically
+admit, which manifests as a sustained retry storm.
+
+### Per-op — 0/5 PASS
+
+| Run | TPS | p50 | p95 | p99 | p99.9 | Max | Retry% | Pass |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 4196 | 5.75 | 266.87 | 1246.39 | 1892.95 | 2481.10 | 136.49 | ❌ |
+| 2 | 4110 | 5.61 | 108.82 | 961.82 | 1870.83 | 2012.11 | 102.27 | ❌ |
+| 3 | 3863 | 5.59 | 153.24 | 1084.61 | 1880.63 | 2003.78 | 108.28 | ❌ |
+| 4 | 3666 | 5.59 | 226.59 | 1104.64 | 1896.47 | 2003.51 | 112.46 | ❌ |
+| 5 | 3674 | 5.51 | 81.36 | 934.25 | 1861.70 | 2003.87 | 99.72 | ❌ |
+
+p99 distribution: min 934 / median 1085 / max 1246 / stddev 125 ms.
+TPS dropped to 73–84 % of target. Retry rate consistently >100 %
+(every commit averaged more than one retry).
+
+### Client-bulk — 0/5 PASS
+
+| Run | TPS | p50 | p95 | p99 | p99.9 | Max | Retry% | Pass |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 3714 | 4.72 | 17.56 | 87.42 | 775.17 | 2000.64 | 26.48 | ❌ |
+| 2 | 3644 | 4.68 | 13.18 | 36.09 | 109.19 | 1115.64 | 19.55 | ❌ |
+| 3 | 3532 | 4.70 | 20.82 | 115.75 | 876.22 | 2001.98 | 30.91 | ❌ |
+| 4 | 3425 | 4.74 | 78.71 | 740.13 | 1568.28 | 2178.71 | 50.54 | ❌ |
+| 5 | 3460 | 4.71 | 31.35 | 297.35 | 1522.97 | 2003.18 | 38.08 | ❌ |
+
+p99 distribution: min 36 / median 116 / max 740 / stddev 288 ms.
+TPS 3425–3714 (69–74 % of target). Note: median p99 is lower than per-op
+because client-bulk's single-round-trip txns fail-and-retry faster, but
+the tail is more variable.
+
+### Why this is *not* production-realistic
+
+Real-world payments card distributions are typically much milder than
+Zipf `s=1.1`. Even fraud-heavy environments rarely have ~13 % of all
+authorisations concentrated on one card. More realistic models look
+like:
+
+- **Mild skew (recommended for production-rep test)**: 80 % of traffic
+  uniform across all 1M cards + 20 % concentrated on the top 1000 cards.
+  Top card sees ~5–10 TPS, no document is contended.
+- **Moderate skew**: top 0.1 % of cards (1000 cards) get 30 % of traffic,
+  rest uniform. Still no card approaches the ~450 TPS serialization
+  ceiling.
+
+To run a production-realistic Shape C, we'd add a `SKEW_MODE=mixed`
+flag with `HOT_FRAC` and `HOT_SET` parameters. Not done yet — this run
+was an unintended upper bound. The hypothesis for the mild-skew run:
+passes 5K TPS at p99 ≤ 20 ms since no individual card approaches its
+ceiling.
+
+### What this DOES prove
+
+Consistent with Scenario 2:
+
+- **Single-document throughput is bounded at ~450–485 TPS** by MongoDB's
+  MVCC serialization. Demand above that ceiling forces retries.
+- **Cluster-wide TPS drops** when a sustained retry storm consumes primary
+  CPU and WiredTiger write tickets. At Zipf `s=1.1`, effective TPS
+  drops to ~70–80 % of target.
+- **Mitigation pattern is the same as Scenario 2**: app-tier coalescing,
+  cardholder_velocity sharding (256-way pattern), or a sharded cluster
+  with `{cardId, hash}` shard key for cases where one card genuinely
+  must absorb >450 TPS.
+
+---
+
 ## 64 GB battery (preserved baseline)
 
 `SESSIONS=3000 TARGET_TPS=5000 DURATION=120 ./run_battery.sh 5`
