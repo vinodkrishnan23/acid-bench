@@ -75,15 +75,24 @@ echo " duration:       ${DURATION}s   (overlapping)"
 echo " output:         $OUTDIR"
 echo "============================================================"
 
-# Snapshot cluster-wide writeConflicts BEFORE.
-mongosh "$MONGO_URI" --quiet --eval '
-  const s = db.adminCommand({serverStatus: 1});
-  print(JSON.stringify({
-    writeConflicts: s.metrics.operation.writeConflicts,
-    ts: new Date().toISOString()
-  }));
-' > "$WC_BEFORE" 2>/dev/null || echo '{"writeConflicts":0}' > "$WC_BEFORE"
-WC_PRE=$(awk -F'[:,}]' '{for(i=1;i<=NF;i++) if($i~/writeConflicts/){print $(i+1)+0; exit}}' "$WC_BEFORE")
+# Top up the hot card so the storm doesn't run out of balance — each successful txn
+# drains the card by 100-5000 paise; without this, repeated runs against the same
+# card report 0 commits / 0 errors because every attempt hits errInsufficient.
+# We set to 10^12 paise (~₹10 billion). Plenty for any single run.
+mongosh "$MONGO_URI" --quiet --eval "
+  const r = db.getSiblingDB('fss_acid_bench').cards.updateOne(
+    {_id: '$HOT_CARD_ID'},
+    {\$set: {balance: NumberLong('1000000000000'), status: 'ACTIVE'}}
+  );
+  print('hot card balance reset: matched=' + r.matchedCount + ' modified=' + r.modifiedCount);
+" 2>&1 | tail -3
+
+# Snapshot cluster-wide writeConflicts BEFORE — use simple numeric print, not JSON.
+WC_PRE="$(mongosh "$MONGO_URI" --quiet --eval '
+  print(db.adminCommand({serverStatus: 1}).metrics.operation.writeConflicts);
+' 2>/dev/null | tail -1 | tr -d -c '0-9')"
+WC_PRE="${WC_PRE:-0}"
+echo "{\"writeConflicts\":$WC_PRE}" > "$WC_BEFORE"
 echo "writeConflicts BEFORE: $WC_PRE"
 echo ""
 
@@ -113,15 +122,12 @@ echo "Hot card storm (hotdoc) PID=$HOT_PID"
 wait "$PEROP_PID" || true
 wait "$HOT_PID"   || true
 
-# Snapshot writeConflicts AFTER.
-mongosh "$MONGO_URI" --quiet --eval '
-  const s = db.adminCommand({serverStatus: 1});
-  print(JSON.stringify({
-    writeConflicts: s.metrics.operation.writeConflicts,
-    ts: new Date().toISOString()
-  }));
-' > "$WC_AFTER" 2>/dev/null || echo '{"writeConflicts":0}' > "$WC_AFTER"
-WC_POST=$(awk -F'[:,}]' '{for(i=1;i<=NF;i++) if($i~/writeConflicts/){print $(i+1)+0; exit}}' "$WC_AFTER")
+# Snapshot writeConflicts AFTER — simple numeric print.
+WC_POST="$(mongosh "$MONGO_URI" --quiet --eval '
+  print(db.adminCommand({serverStatus: 1}).metrics.operation.writeConflicts);
+' 2>/dev/null | tail -1 | tr -d -c '0-9')"
+WC_POST="${WC_POST:-0}"
+echo "{\"writeConflicts\":$WC_POST}" > "$WC_AFTER"
 WC_DELTA=$((WC_POST - WC_PRE))
 
 # Pull the summary lines out of each bench log.

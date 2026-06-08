@@ -130,9 +130,9 @@ if [[ -s "$CSV" ]]; then
   echo "============================================================"
   echo " Per-second TPS — pre / during / post the stepDown window"
   echo "============================================================"
-  awk -F, -v step="$STEP_AT" -v elect="$ELECT_SEC" '
+  awk -F, -v step="$STEP_AT" -v elect="$ELECT_SEC" -v dur="$DURATION" '
     NR==1 { next }
-    {
+    ($1+0) < dur {                         # ignore trailing empty buckets past the bench duration
       sec = $1; tps = $2;
       if (sec < step)                          { n_pre++;    s_pre   += tps }
       else if (sec < step + elect + 5)         { n_during++; s_during+= tps }
@@ -141,7 +141,7 @@ if [[ -s "$CSV" ]]; then
     END {
       printf "  pre    (0 .. %ds):     n=%d  avg_tps=%.1f\n", step, n_pre, (n_pre?s_pre/n_pre:0)
       printf "  during (%d .. %ds):    n=%d  avg_tps=%.1f\n", step, step+elect+5, n_during, (n_during?s_during/n_during:0)
-      printf "  post   (%d .. end):    n=%d  avg_tps=%.1f\n", step+elect+5, n_post, (n_post?s_post/n_post:0)
+      printf "  post   (%d .. %ds):    n=%d  avg_tps=%.1f\n", step+elect+5, dur, n_post, (n_post?s_post/n_post:0)
     }
   ' "$CSV"
 fi
