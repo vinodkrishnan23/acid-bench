@@ -5,7 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/env.sh"
 export PATH=$PATH:/usr/local/go/bin:$HOME/go/bin
 
-mkdir -p "$GO_DIR/perop" "$GO_DIR/clientbulk" "$GO_DIR/srvmon"
+mkdir -p "$GO_DIR/perop" "$GO_DIR/clientbulk" "$GO_DIR/srvmon" \
+         "$GO_DIR/iso8583_perop" "$GO_DIR/iso8583_bulk" "$GO_DIR/iso8583seed"
 cd "$GO_DIR"
 [[ -f go.mod ]] || go mod init rwbbench
 
@@ -431,6 +432,581 @@ func report(name string, latCh [][]float64, committed, errs, retries []int, elap
 }
 EOF
 
+# ========== ISO 8583 PER-OP VARIANT (idempotency cache, 6 round-trips/txn) ==========
+# Separate idempotency_cache collection holds the dedup key + cached response.
+# Per fresh txn (6 round-trips):
+#   1. InsertOne idempotency_cache       (gate; DuplicateKey → return cached)
+#   2. UpdateOne cards (conditional $gte)
+#   3. InsertOne txn_ledger_iso  (status APPROVED|DECLINED from cards.matchedCount)
+#   4. UpdateOne cardholder_velocity     (upsert)
+#   5. UpdateOne merchant_velocity       (upsert)
+#   6. UpdateOne idempotency_cache       (status=COMPLETED + response)
+# Commits on DECLINED (records the decline in ledger + cache).
+cat > iso8583_perop/main.go <<EOF
+package main
+
+import (
+	"context"
+	"encoding/binary"
+	"fmt"
+	"math/rand"
+	"os"
+	"sort"
+	"sync"
+	"time"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
+)
+
+$CONSTS
+
+var errDuplicate = fmt.Errorf("duplicate_idempotency_key")
+
+type recentTuple struct { rrn, stan, acq string; ts time.Time }
+
+func main() {
+	if len(os.Args) < 4 { fmt.Println("usage: iso8583_perop <sessions> <target_tps> <duration_s>"); os.Exit(1) }
+	var sessions, targetTPS, durSec int
+	fmt.Sscan(os.Args[1], &sessions); fmt.Sscan(os.Args[2], &targetTPS); fmt.Sscan(os.Args[3], &durSec)
+	minPool := envInt("MIN_POOL", 500); maxPool := envInt("MAX_POOL", 1000)
+	warmupSec := envInt("WARMUP_SEC", 10)
+	cycle := time.Duration(float64(sessions)/float64(targetTPS)*1000) * time.Millisecond
+
+	dupRate := 0.08
+	if v := os.Getenv("DUPLICATE_RATE"); v != "" { fmt.Sscan(v, &dupRate) }
+	if dupRate < 0 { dupRate = 0 }; if dupRate > 1 { dupRate = 1 }
+	retryWindowSec := envInt("RETRY_WINDOW_SEC", 30)
+
+	uri := os.Getenv("MONGO_URI"); ctx := context.Background()
+	cli, err := mongo.Connect(options.Client().ApplyURI(uri).
+		SetMaxPoolSize(uint64(maxPool)).SetMinPoolSize(uint64(minPool)))
+	if err != nil { panic(err) }
+	defer cli.Disconnect(ctx)
+	if err := cli.Ping(ctx, nil); err != nil { panic(err) }
+	{ var w sync.WaitGroup
+		for i := 0; i < 200; i++ { w.Add(1); go func(){ defer w.Done(); for k:=0;k<20;k++{cli.Ping(ctx,nil)} }() }
+		w.Wait(); time.Sleep(2*time.Second) }
+
+	db := cli.Database(dbName)
+	cards    := db.Collection("cards")
+	ledger   := db.Collection("txn_ledger_iso")
+	cardVel  := db.Collection("cardholder_velocity")
+	merchVel := db.Collection("merchant_velocity")
+	idem     := db.Collection("idempotency_cache")
+	txnOpts := options.Transaction().SetWriteConcern(writeconcern.Majority())
+	upsertOpt := options.UpdateOne().SetUpsert(true)
+
+	fmt.Printf("ISO8583 PER-OP idempotency  sessions=%d  target_tps=%d  duration=%ds  dup_rate=%.2f  retry_window=%ds\n",
+		sessions, targetTPS, durSec, dupRate, retryWindowSec)
+
+	var wg sync.WaitGroup
+	latFresh := make([][]float64, sessions); latRetry := make([][]float64, sessions)
+	committed := make([]int, sessions); declined := make([]int, sessions); cacheHits := make([]int, sessions)
+	errs := make([]int, sessions); retries := make([]int, sessions)
+	start := time.Now(); deadline := start.Add(time.Duration(durSec)*time.Second)
+	window := time.Duration(retryWindowSec) * time.Second
+
+	for i := 0; i < sessions; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			r := rand.New(rand.NewSource(time.Now().UnixNano()+int64(id)))
+			time.Sleep(time.Duration(int64(cycle)/int64(sessions)*int64(id)))
+			sess, err := cli.StartSession(); if err != nil { errs[id]++; return }
+			defer sess.EndSession(ctx)
+			recents := make([]recentTuple, 0, 128)
+			for time.Now().Before(deadline) {
+				cIdx := r.Intn(numCards) + 1
+				mIdx := pickMerchant(r) + 1
+				amount := int64(r.Intn(txnAmountMax-txnAmountMin+1) + txnAmountMin)
+				cb := r.Intn(merchBuckets)
+				cidStr := cardID(cIdx); midStr := merchID(mIdx)
+				now := time.Now(); hb := hourBucket(now); dbStr := dayBucket(now)
+				cvID := bson.D{{Key: "cardId", Value: cidStr}, {Key: "bucket", Value: dbStr}}
+				mvID := bson.D{{Key: "mid", Value: midStr}, {Key: "bucket", Value: hb}, {Key: "cb", Value: cb}}
+
+				cutoff := now.Add(-window)
+				prune := 0
+				for prune < len(recents) && recents[prune].ts.Before(cutoff) { prune++ }
+				if prune > 0 { recents = recents[prune:] }
+
+				var rrn, stan, acq string
+				isReplay := len(recents) > 0 && r.Float64() < dupRate
+				if isReplay {
+					e := recents[r.Intn(len(recents))]
+					rrn = e.rrn; stan = e.stan; acq = e.acq
+				} else {
+					rrn = randStr(r) + randStr(r)
+					stan = fmt.Sprintf("%06d", r.Intn(1000000))
+					acq = "ACQ001"
+				}
+				idemID := rrn + "|" + stan + "|" + acq
+
+				attempts := 0
+				t0 := time.Now()
+				txnCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+				_, txErr := sess.WithTransaction(txnCtx, func(sc context.Context) (interface{}, error) {
+					attempts++
+					// 1. cache gate
+					_, e := idem.InsertOne(sc, bson.M{
+						"_id": idemID,
+						"status": "PENDING",
+						"createdAt": now,
+						"request": bson.M{"cardId": cidStr, "mid": midStr, "amount": amount, "ts": now},
+					})
+					if mongo.IsDuplicateKeyError(e) { return nil, errDuplicate }
+					if e != nil { return nil, e }
+					// 2. conditional debit
+					res, e := cards.UpdateOne(sc,
+						bson.M{"_id": cidStr, "status": "ACTIVE", "balance": bson.M{"\$gte": amount}},
+						bson.M{"\$inc": bson.M{"balance": -amount, "version": 1}, "\$set": bson.M{"last_updated": now, "activity.last_txn_at": now}})
+					if e != nil { return nil, e }
+					status := "APPROVED"
+					if res.MatchedCount == 0 { status = "DECLINED" }
+					// 3. ledger insert (always — commit DECLINEs)
+					doc := buildLedgerDoc(cidStr, midStr, amount, now, r)
+					auth := doc["auth"].(bson.M)
+					auth["rrn"] = rrn; auth["stan"] = stan; auth["acquirerCode"] = acq
+					doc["status"] = status; doc["createdAt"] = now
+					doc["response"] = bson.M{"code": status, "approvalCode": fmt.Sprintf("%06d", r.Intn(1000000)), "ts": now}
+					if _, e := ledger.InsertOne(sc, doc); e != nil { return nil, e }
+					// 4. cardholder_velocity (only on APPROVED — no velocity for declines)
+					if status == "APPROVED" {
+						if _, e := cardVel.UpdateOne(sc, bson.M{"_id": cvID},
+							bson.M{"\$inc": bson.M{"count": 1, "sum": amount}, "\$set": bson.M{"updatedAt": now}},
+							upsertOpt); e != nil { return nil, e }
+						// 5. merchant_velocity
+						if _, e := merchVel.UpdateOne(sc, bson.M{"_id": mvID},
+							bson.M{"\$inc": bson.M{"count": 1, "sum": amount}, "\$set": bson.M{"updatedAt": now}},
+							upsertOpt); e != nil { return nil, e }
+					}
+					// 6. finalize cache
+					if _, e := idem.UpdateOne(sc,
+						bson.M{"_id": idemID},
+						bson.M{"\$set": bson.M{"status": "COMPLETED", "response": doc["response"], "finalStatus": status}}); e != nil { return nil, e }
+					if status == "APPROVED" { committed[id]++; } else { declined[id]++ }
+					return nil, nil
+				}, txnOpts)
+				cancel()
+				if attempts > 1 { retries[id] += attempts - 1 }
+				wall := float64(time.Since(t0).Microseconds())/1000.0
+				postWarmup := time.Since(start).Seconds() > float64(warmupSec)
+
+				if txErr == errDuplicate {
+					rt0 := time.Now()
+					findCtx, fc := context.WithTimeout(ctx, 1*time.Second)
+					var existing bson.M
+					_ = idem.FindOne(findCtx, bson.M{"_id": idemID}).Decode(&existing)
+					fc()
+					rt := float64(time.Since(rt0).Microseconds())/1000.0
+					if postWarmup {
+						cacheHits[id]++
+						latRetry[id] = append(latRetry[id], wall+rt)
+					}
+				} else if txErr != nil {
+					// roll back attempted commit/declined counters that got bumped pre-error
+					errs[id]++
+				} else {
+					if postWarmup {
+						latFresh[id] = append(latFresh[id], wall)
+					}
+					if !isReplay {
+						recents = append(recents, recentTuple{rrn, stan, acq, now})
+						if len(recents) > 128 { recents = recents[1:] }
+					}
+				}
+				if rem := cycle - time.Since(t0); rem > 0 { time.Sleep(time.Duration(float64(rem)*(0.8+0.4*r.Float64()))) }
+			}
+		}(i)
+	}
+	wg.Wait()
+	report("ISO8583-PEROP", latFresh, latRetry, committed, declined, cacheHits, errs, retries, time.Since(start).Seconds(), float64(warmupSec))
+}
+
+func report(name string, latFresh, latRetry [][]float64, committed, declined, cacheHits, errs, retries []int, elapsed, warmup float64) {
+	var fresh, retry []float64
+	ta, td, tch, te, tr := 0, 0, 0, 0, 0
+	for i := range latFresh {
+		fresh = append(fresh, latFresh[i]...); retry = append(retry, latRetry[i]...)
+		ta += committed[i]; td += declined[i]; tch += cacheHits[i]; te += errs[i]; tr += retries[i]
+	}
+	sort.Float64s(fresh); sort.Float64s(retry)
+	win := elapsed - warmup; if win <= 0 { win = elapsed }
+	pct := func(s []float64, p float64) float64 {
+		if len(s) == 0 { return 0 }
+		idx := int(p/100*float64(len(s))); if idx >= len(s) { idx = len(s)-1 }
+		return s[idx]
+	}
+	totalFresh := ta + td
+	total := totalFresh + tch
+	fmt.Println("==================================================")
+	fmt.Printf("GO RWB-%s STEADY-STATE (%.1fs total, %.1fs measured)\n", name, elapsed, win)
+	fmt.Println("==================================================")
+	fmt.Printf("  fresh APPROVED: %d  fresh DECLINED: %d  cache_hits: %d  errors: %d\n", ta, td, tch, te)
+	fmt.Printf("  total ops: %d  TPS: %.0f  retries (WriteConflict): %d\n", total, float64(total)/win, tr)
+	if total > 0 {
+		fmt.Printf("  observed duplicate rate: %.2f%%\n", 100.0*float64(tch)/float64(total))
+	}
+	if len(fresh) > 0 {
+		fmt.Println("  --- fresh path (6 round-trips: cache+cards+ledger+2vel+cache_finalize) ---")
+		fmt.Printf("  median %.2f  p95 %.2f  p99 %.2f  p99.9 %.2f  max %.2f\n",
+			pct(fresh,50), pct(fresh,95), pct(fresh,99), pct(fresh,99.9), fresh[len(fresh)-1])
+		pass := pct(fresh,99) <= pLatencyMs
+		fmt.Printf("  PASS (fresh p99<=20ms)? %v\n", pass)
+	}
+	if len(retry) > 0 {
+		fmt.Println("  --- retry path (DuplicateKey + cache read) ---")
+		fmt.Printf("  median %.2f  p95 %.2f  p99 %.2f  p99.9 %.2f  max %.2f\n",
+			pct(retry,50), pct(retry,95), pct(retry,99), pct(retry,99.9), retry[len(retry)-1])
+	}
+}
+EOF
+
+# ========== ISO 8583 BULK VARIANT (idempotency cache, 2 round-trips/txn) ==========
+# Same idempotency_cache pattern, but compressed to 2 ClientBulkWrite round-trips:
+#   Bulk #1:  [InsertOne idem_cache, UpdateOne cards (\$gte)]   (1 round-trip)
+#             → inspect for DuplicateKey on op[0]; status from cards.matchedCount
+#   Bulk #2:  [InsertOne ledger, UpdateOne cardVel, UpdateOne merchVel,
+#              UpdateOne idem_cache (finalize)]                  (1 round-trip)
+# Velocity ops are still issued for DECLINED rows (so the count comparison vs
+# perop is apples-to-apples — the bulk's strength is in compressing network
+# round-trips, not in reducing total writes).
+cat > iso8583_bulk/main.go <<EOF
+package main
+
+import (
+	"context"
+	"encoding/binary"
+	"fmt"
+	"math/rand"
+	"os"
+	"sort"
+	"sync"
+	"time"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
+)
+
+$CONSTS
+
+var errDuplicate = fmt.Errorf("duplicate_idempotency_key")
+
+type recentTuple struct { rrn, stan, acq string; ts time.Time }
+
+func main() {
+	if len(os.Args) < 4 { fmt.Println("usage: iso8583_bulk <sessions> <target_tps> <duration_s>"); os.Exit(1) }
+	var sessions, targetTPS, durSec int
+	fmt.Sscan(os.Args[1], &sessions); fmt.Sscan(os.Args[2], &targetTPS); fmt.Sscan(os.Args[3], &durSec)
+	minPool := envInt("MIN_POOL", 500); maxPool := envInt("MAX_POOL", 1000)
+	warmupSec := envInt("WARMUP_SEC", 10)
+	cycle := time.Duration(float64(sessions)/float64(targetTPS)*1000) * time.Millisecond
+
+	dupRate := 0.08
+	if v := os.Getenv("DUPLICATE_RATE"); v != "" { fmt.Sscan(v, &dupRate) }
+	if dupRate < 0 { dupRate = 0 }; if dupRate > 1 { dupRate = 1 }
+	retryWindowSec := envInt("RETRY_WINDOW_SEC", 30)
+
+	uri := os.Getenv("MONGO_URI"); ctx := context.Background()
+	cli, err := mongo.Connect(options.Client().ApplyURI(uri).
+		SetMaxPoolSize(uint64(maxPool)).SetMinPoolSize(uint64(minPool)))
+	if err != nil { panic(err) }
+	defer cli.Disconnect(ctx)
+	if err := cli.Ping(ctx, nil); err != nil { panic(err) }
+	{ var w sync.WaitGroup
+		for i := 0; i < 200; i++ { w.Add(1); go func(){ defer w.Done(); for k:=0;k<20;k++{cli.Ping(ctx,nil)} }() }
+		w.Wait(); time.Sleep(2*time.Second) }
+
+	txnOpts := options.Transaction().SetWriteConcern(writeconcern.Majority())
+
+	fmt.Printf("ISO8583 BULK idempotency  sessions=%d  target_tps=%d  duration=%ds  dup_rate=%.2f  retry_window=%ds\n",
+		sessions, targetTPS, durSec, dupRate, retryWindowSec)
+
+	var wg sync.WaitGroup
+	latFresh := make([][]float64, sessions); latRetry := make([][]float64, sessions)
+	committed := make([]int, sessions); declined := make([]int, sessions); cacheHits := make([]int, sessions)
+	errs := make([]int, sessions); retries := make([]int, sessions)
+	start := time.Now(); deadline := start.Add(time.Duration(durSec)*time.Second)
+	window := time.Duration(retryWindowSec) * time.Second
+
+	for i := 0; i < sessions; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			r := rand.New(rand.NewSource(time.Now().UnixNano()+int64(id)))
+			time.Sleep(time.Duration(int64(cycle)/int64(sessions)*int64(id)))
+			sess, err := cli.StartSession(); if err != nil { errs[id]++; return }
+			defer sess.EndSession(ctx)
+			recents := make([]recentTuple, 0, 128)
+			for time.Now().Before(deadline) {
+				cIdx := r.Intn(numCards) + 1
+				mIdx := pickMerchant(r) + 1
+				amount := int64(r.Intn(txnAmountMax-txnAmountMin+1) + txnAmountMin)
+				cb := r.Intn(merchBuckets)
+				cidStr := cardID(cIdx); midStr := merchID(mIdx)
+				now := time.Now(); hb := hourBucket(now); dbStr := dayBucket(now)
+				cvID := bson.D{{Key: "cardId", Value: cidStr}, {Key: "bucket", Value: dbStr}}
+				mvID := bson.D{{Key: "mid", Value: midStr}, {Key: "bucket", Value: hb}, {Key: "cb", Value: cb}}
+
+				cutoff := now.Add(-window)
+				prune := 0
+				for prune < len(recents) && recents[prune].ts.Before(cutoff) { prune++ }
+				if prune > 0 { recents = recents[prune:] }
+
+				var rrn, stan, acq string
+				isReplay := len(recents) > 0 && r.Float64() < dupRate
+				if isReplay {
+					e := recents[r.Intn(len(recents))]
+					rrn = e.rrn; stan = e.stan; acq = e.acq
+				} else {
+					rrn = randStr(r) + randStr(r)
+					stan = fmt.Sprintf("%06d", r.Intn(1000000))
+					acq = "ACQ001"
+				}
+				idemID := rrn + "|" + stan + "|" + acq
+
+				attempts := 0
+				t0 := time.Now()
+				txnCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+				_, txErr := sess.WithTransaction(txnCtx, func(sc context.Context) (interface{}, error) {
+					attempts++
+					// Bulk #1: cache insert + cards conditional update
+					bulk1 := []mongo.ClientBulkWrite{
+						{Database: dbName, Collection: "idempotency_cache",
+							Model: mongo.NewClientInsertOneModel().SetDocument(bson.M{
+								"_id": idemID,
+								"status": "PENDING",
+								"createdAt": now,
+								"request": bson.M{"cardId": cidStr, "mid": midStr, "amount": amount, "ts": now},
+							})},
+						{Database: dbName, Collection: "cards",
+							Model: mongo.NewClientUpdateOneModel().
+								SetFilter(bson.M{"_id": cidStr, "status": "ACTIVE", "balance": bson.M{"\$gte": amount}}).
+								SetUpdate(bson.M{"\$inc": bson.M{"balance": -amount, "version": 1}, "\$set": bson.M{"last_updated": now, "activity.last_txn_at": now}})},
+					}
+					res1, e := cli.BulkWrite(sc, bulk1, options.ClientBulkWrite().SetOrdered(true))
+					if mongo.IsDuplicateKeyError(e) { return nil, errDuplicate }
+					if e != nil { return nil, e }
+					status := "APPROVED"
+					if res1.MatchedCount == 0 { status = "DECLINED" }
+
+					// Build ledger doc with computed status
+					doc := buildLedgerDoc(cidStr, midStr, amount, now, r)
+					auth := doc["auth"].(bson.M)
+					auth["rrn"] = rrn; auth["stan"] = stan; auth["acquirerCode"] = acq
+					doc["status"] = status; doc["createdAt"] = now
+					doc["response"] = bson.M{"code": status, "approvalCode": fmt.Sprintf("%06d", r.Intn(1000000)), "ts": now}
+
+					// Bulk #2: ledger insert + velocity upserts + cache finalize
+					bulk2 := []mongo.ClientBulkWrite{
+						{Database: dbName, Collection: "txn_ledger_iso",
+							Model: mongo.NewClientInsertOneModel().SetDocument(doc)},
+						{Database: dbName, Collection: "cardholder_velocity",
+							Model: mongo.NewClientUpdateOneModel().
+								SetFilter(bson.M{"_id": cvID}).
+								SetUpdate(bson.M{"\$inc": bson.M{"count": 1, "sum": amount}, "\$set": bson.M{"updatedAt": now}}).
+								SetUpsert(true)},
+						{Database: dbName, Collection: "merchant_velocity",
+							Model: mongo.NewClientUpdateOneModel().
+								SetFilter(bson.M{"_id": mvID}).
+								SetUpdate(bson.M{"\$inc": bson.M{"count": 1, "sum": amount}, "\$set": bson.M{"updatedAt": now}}).
+								SetUpsert(true)},
+						{Database: dbName, Collection: "idempotency_cache",
+							Model: mongo.NewClientUpdateOneModel().
+								SetFilter(bson.M{"_id": idemID}).
+								SetUpdate(bson.M{"\$set": bson.M{"status": "COMPLETED", "response": doc["response"], "finalStatus": status}})},
+					}
+					if _, e := cli.BulkWrite(sc, bulk2, options.ClientBulkWrite().SetOrdered(true)); e != nil { return nil, e }
+					if status == "APPROVED" { committed[id]++ } else { declined[id]++ }
+					return nil, nil
+				}, txnOpts)
+				cancel()
+				if attempts > 1 { retries[id] += attempts - 1 }
+				wall := float64(time.Since(t0).Microseconds())/1000.0
+				postWarmup := time.Since(start).Seconds() > float64(warmupSec)
+
+				if txErr == errDuplicate {
+					rt0 := time.Now()
+					findCtx, fc := context.WithTimeout(ctx, 1*time.Second)
+					var existing bson.M
+					_ = cli.Database(dbName).Collection("idempotency_cache").
+						FindOne(findCtx, bson.M{"_id": idemID}).Decode(&existing)
+					fc()
+					rt := float64(time.Since(rt0).Microseconds())/1000.0
+					if postWarmup {
+						cacheHits[id]++
+						latRetry[id] = append(latRetry[id], wall+rt)
+					}
+				} else if txErr != nil {
+					errs[id]++
+				} else {
+					if postWarmup {
+						latFresh[id] = append(latFresh[id], wall)
+					}
+					if !isReplay {
+						recents = append(recents, recentTuple{rrn, stan, acq, now})
+						if len(recents) > 128 { recents = recents[1:] }
+					}
+				}
+				if rem := cycle - time.Since(t0); rem > 0 { time.Sleep(time.Duration(float64(rem)*(0.8+0.4*r.Float64()))) }
+			}
+		}(i)
+	}
+	wg.Wait()
+	report("ISO8583-BULK", latFresh, latRetry, committed, declined, cacheHits, errs, retries, time.Since(start).Seconds(), float64(warmupSec))
+}
+
+func report(name string, latFresh, latRetry [][]float64, committed, declined, cacheHits, errs, retries []int, elapsed, warmup float64) {
+	var fresh, retry []float64
+	ta, td, tch, te, tr := 0, 0, 0, 0, 0
+	for i := range latFresh {
+		fresh = append(fresh, latFresh[i]...); retry = append(retry, latRetry[i]...)
+		ta += committed[i]; td += declined[i]; tch += cacheHits[i]; te += errs[i]; tr += retries[i]
+	}
+	sort.Float64s(fresh); sort.Float64s(retry)
+	win := elapsed - warmup; if win <= 0 { win = elapsed }
+	pct := func(s []float64, p float64) float64 {
+		if len(s) == 0 { return 0 }
+		idx := int(p/100*float64(len(s))); if idx >= len(s) { idx = len(s)-1 }
+		return s[idx]
+	}
+	totalFresh := ta + td
+	total := totalFresh + tch
+	fmt.Println("==================================================")
+	fmt.Printf("GO RWB-%s STEADY-STATE (%.1fs total, %.1fs measured)\n", name, elapsed, win)
+	fmt.Println("==================================================")
+	fmt.Printf("  fresh APPROVED: %d  fresh DECLINED: %d  cache_hits: %d  errors: %d\n", ta, td, tch, te)
+	fmt.Printf("  total ops: %d  TPS: %.0f  retries (WriteConflict): %d\n", total, float64(total)/win, tr)
+	if total > 0 {
+		fmt.Printf("  observed duplicate rate: %.2f%%\n", 100.0*float64(tch)/float64(total))
+	}
+	if len(fresh) > 0 {
+		fmt.Println("  --- fresh path (2 round-trips: bulk1[cache+cards], bulk2[ledger+vel+vel+cache]) ---")
+		fmt.Printf("  median %.2f  p95 %.2f  p99 %.2f  p99.9 %.2f  max %.2f\n",
+			pct(fresh,50), pct(fresh,95), pct(fresh,99), pct(fresh,99.9), fresh[len(fresh)-1])
+		pass := pct(fresh,99) <= pLatencyMs
+		fmt.Printf("  PASS (fresh p99<=20ms)? %v\n", pass)
+	}
+	if len(retry) > 0 {
+		fmt.Println("  --- retry path (DuplicateKey + cache read) ---")
+		fmt.Printf("  median %.2f  p95 %.2f  p99 %.2f  p99.9 %.2f  max %.2f\n",
+			pct(retry,50), pct(retry,95), pct(retry,99), pct(retry,99.9), retry[len(retry)-1])
+	}
+}
+EOF
+
+# ============================ ISO 8583 SEEDER ============================
+# Bulk-inserts N rows into txn_ledger_iso. Uses cardID()/merchID() with valid
+# indices so seeded rows reference cards/velocity collections seeded by the
+# existing 02_seed.sh / 04_seed_ledger.sh. w=1 for seed speed.
+cat > iso8583seed/main.go <<EOF
+package main
+
+import (
+	"context"
+	"encoding/binary"
+	"fmt"
+	"math/rand"
+	"os"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
+)
+
+$CONSTS
+
+func main() {
+	if len(os.Args) < 2 { fmt.Println("usage: iso8583seed <num_rows>"); os.Exit(1) }
+	var numRows int
+	fmt.Sscan(os.Args[1], &numRows)
+	if numRows <= 0 { fmt.Println("num_rows must be > 0"); os.Exit(1) }
+
+	workers := envInt("SEED_WORKERS", 32)
+	batchSize := envInt("SEED_BATCH", 1000)
+	spanHours := envInt("SEED_SPAN_HOURS", 23)
+
+	uri := os.Getenv("MONGO_URI"); ctx := context.Background()
+	cli, err := mongo.Connect(options.Client().ApplyURI(uri).
+		SetMaxPoolSize(uint64(workers*2)).
+		SetWriteConcern(writeconcern.W1()))
+	if err != nil { panic(err) }
+	defer cli.Disconnect(ctx)
+	if err := cli.Ping(ctx, nil); err != nil { panic(err) }
+
+	db := cli.Database(dbName)
+	ledger := db.Collection("txn_ledger_iso")
+
+	fmt.Printf("Seeding %d rows into txn_ledger_iso  workers=%d  batch=%d  createdAt span=%dh  wc=1\n",
+		numRows, workers, batchSize, spanHours)
+	fmt.Printf("  cardId in [CARD-0000000001, CARD-%010d]  mid in [M0000001, M%07d]\n",
+		numCards, numMerchants)
+
+	var wg sync.WaitGroup
+	var progress int64
+	start := time.Now()
+	spanNs := int64(spanHours) * int64(time.Hour)
+	perWorker := numRows / workers
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(wid int) {
+			defer wg.Done()
+			r := rand.New(rand.NewSource(time.Now().UnixNano() + int64(wid)))
+			todo := perWorker
+			if wid == workers-1 { todo += numRows - perWorker*workers }
+			batch := make([]interface{}, 0, batchSize)
+			for done := 0; done < todo; {
+				n := batchSize
+				if todo-done < n { n = todo - done }
+				batch = batch[:0]
+				for k := 0; k < n; k++ {
+					cIdx := r.Intn(numCards) + 1
+					mIdx := pickMerchant(r) + 1
+					amount := int64(r.Intn(txnAmountMax-txnAmountMin+1) + txnAmountMin)
+					ageNs := r.Int63n(spanNs)
+					cAt := time.Now().Add(-time.Duration(ageNs))
+					doc := buildLedgerDoc(cardID(cIdx), merchID(mIdx), amount, cAt, r)
+					auth := doc["auth"].(bson.M)
+					auth["rrn"] = randStr(r) + randStr(r)
+					auth["stan"] = fmt.Sprintf("%06d", r.Intn(1000000))
+					auth["acquirerCode"] = "ACQ001"
+					doc["status"] = "APPROVED"
+					doc["createdAt"] = cAt
+					doc["response"] = bson.M{"code": "APPROVED", "approvalCode": fmt.Sprintf("%06d", r.Intn(1000000)), "ts": cAt}
+					batch = append(batch, doc)
+				}
+				_, err := ledger.InsertMany(ctx, batch, options.InsertMany().SetOrdered(false))
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "  worker %d batch error (continuing): %v\n", wid, err)
+				}
+				done += n
+				total := atomic.AddInt64(&progress, int64(n))
+				if total%1000000 < int64(n) {
+					elapsed := time.Since(start).Seconds()
+					rate := float64(total) / elapsed
+					eta := (float64(numRows)-float64(total)) / rate
+					fmt.Printf("  seeded %d / %d  (%.1f%%)  rate=%.0f docs/s  elapsed=%.0fs  eta=%.0fs\n",
+						total, numRows, 100.0*float64(total)/float64(numRows), rate, elapsed, eta)
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	elapsed := time.Since(start).Seconds()
+	fmt.Printf("Done: %d rows in %.1fs (%.0f docs/s avg)\n", numRows, elapsed, float64(numRows)/elapsed)
+}
+EOF
+
 # ============================ SRVMON (identical to FSS) ============================
 cat > srvmon/main.go <<'EOF'
 package main
@@ -521,10 +1097,13 @@ func main() {
 }
 EOF
 
-echo "=== go mod tidy + build all three binaries ==="
+echo "=== go mod tidy + build all binaries ==="
 go mod tidy
-go build -o perop_bin ./perop && echo "perop_bin OK"
-go build -o clientbulk_bin ./clientbulk && echo "clientbulk_bin OK"
-go build -o srvmon_bin ./srvmon && echo "srvmon_bin OK"
-ls -la perop_bin clientbulk_bin srvmon_bin
-echo "=== Build done. Next: ./run_perop.sh or ./run_clientbulk.sh ==="
+go build -o perop_bin            ./perop            && echo "perop_bin OK"
+go build -o clientbulk_bin       ./clientbulk       && echo "clientbulk_bin OK"
+go build -o iso8583_perop_bin    ./iso8583_perop    && echo "iso8583_perop_bin OK"
+go build -o iso8583_bulk_bin     ./iso8583_bulk     && echo "iso8583_bulk_bin OK"
+go build -o iso8583seed_bin      ./iso8583seed      && echo "iso8583seed_bin OK"
+go build -o srvmon_bin           ./srvmon           && echo "srvmon_bin OK"
+ls -la perop_bin clientbulk_bin iso8583_perop_bin iso8583_bulk_bin iso8583seed_bin srvmon_bin
+echo "=== Build done. Next: ./run_perop.sh or ./run_clientbulk.sh or scenarios/iso8583_*.sh ==="
