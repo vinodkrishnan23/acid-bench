@@ -63,8 +63,10 @@ echo "verified rows in txn_ledger_iso: $ACTUAL"
 
 # 3. Build the TTL index on idempotency_cache. _id is automatically unique
 #    (string concat of "rrn|stan|acquirerCode"), so no extra unique index needed.
+#    Also add a non-TTL index on txn_ledger_iso.createdAt so post-bench
+#    verification can do bounded range queries fast (rather than 100M-row scans).
 echo ""
-echo "--- step 3/3: TTL index on idempotency_cache.createdAt ---"
+echo "--- step 3/3: indexes (idempotency_cache TTL + ledger createdAt) ---"
 mongosh "$MONGO_URI" --quiet --eval "
   const db_ = db.getSiblingDB('fss_acid_bench');
   db_.idempotency_cache.createIndex(
@@ -72,6 +74,11 @@ mongosh "$MONGO_URI" --quiet --eval "
     { name: 'ttl_idem_25h', expireAfterSeconds: $TTL_SECONDS }
   );
   print('idempotency_cache: TTL index ttl_idem_25h created (expireAfterSeconds=$TTL_SECONDS)');
+  db_.txn_ledger_iso.createIndex(
+    { createdAt: 1 },
+    { name: 'createdAt_1' }
+  );
+  print('txn_ledger_iso: createdAt index created (for verification queries)');
 "
 
 # 4. Final stats

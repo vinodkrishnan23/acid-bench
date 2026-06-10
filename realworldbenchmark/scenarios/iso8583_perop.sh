@@ -57,7 +57,9 @@ echo " output:           $OUT_DIR"
 echo "============================================================"
 
 BENCH_START_EPOCH_MS=$(date +%s)000
+BENCH_END_EPOCH_MS=$(( BENCH_START_EPOCH_MS + (DURATION + 10) * 1000 ))
 echo "$BENCH_START_EPOCH_MS" > "$OUT_DIR/bench_start_epoch_ms.txt"
+echo "$BENCH_END_EPOCH_MS"   > "$OUT_DIR/bench_end_epoch_ms.txt"
 
 BEFORE=$(mongosh "$MONGO_URI" --quiet --eval 'print(db.adminCommand({serverStatus:1}).metrics.operation.writeConflicts)' | tr -d -c '0-9')
 echo "writeConflicts BEFORE: $BEFORE"
@@ -83,13 +85,16 @@ echo "============================================================"
 mongosh "$MONGO_URI" --quiet --eval "
   const db_ = db.getSiblingDB('fss_acid_bench');
   const bs = new Date($BENCH_START_EPOCH_MS);
+  const be = new Date($BENCH_END_EPOCH_MS);
   const lc = db_.txn_ledger_iso;
   const ic = db_.idempotency_cache;
-  const ledgerRows = lc.countDocuments({ createdAt: { \$gte: bs } });
-  const approved   = lc.countDocuments({ createdAt: { \$gte: bs }, status: 'APPROVED' });
-  const declined   = lc.countDocuments({ createdAt: { \$gte: bs }, status: 'DECLINED' });
-  const cacheRows  = ic.countDocuments({ createdAt: { \$gte: bs } });
-  const cachePending = ic.countDocuments({ createdAt: { \$gte: bs }, status: 'PENDING' });
+  const window = { \$gte: bs, \$lt: be };
+  const ledgerRows = lc.countDocuments({ createdAt: window });
+  const approved   = lc.countDocuments({ createdAt: window, status: 'APPROVED' });
+  const declined   = lc.countDocuments({ createdAt: window, status: 'DECLINED' });
+  const cacheRows  = ic.countDocuments({ createdAt: window });
+  const cachePending = ic.countDocuments({ createdAt: window, status: 'PENDING' });
+  print('window               :', bs.toISOString(), 'to', be.toISOString());
   print('ledger rows this run :', ledgerRows);
   print('  APPROVED           :', approved);
   print('  DECLINED           :', declined);

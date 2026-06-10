@@ -790,8 +790,23 @@ func main() {
 								SetUpdate(bson.M{"\$inc": bson.M{"balance": -amount, "version": 1}, "\$set": bson.M{"last_updated": now, "activity.last_txn_at": now}})},
 					}
 					res1, e := cli.BulkWrite(sc, bulk1, options.ClientBulkWrite().SetOrdered(true))
-					if mongo.IsDuplicateKeyError(e) { return nil, errDuplicate }
-					if e != nil { return nil, e }
+					if e != nil {
+						// v2 driver: mongo.IsDuplicateKeyError doesn't unwrap
+						// ClientBulkWriteException. Inspect WriteErrors for code 11000
+						// (duplicate key) ourselves.
+						if mongo.IsDuplicateKeyError(e) { return nil, errDuplicate }
+						if cbwe, ok := e.(mongo.ClientBulkWriteException); ok {
+							for _, we := range cbwe.WriteErrors {
+								if we.Code == 11000 { return nil, errDuplicate }
+							}
+						}
+						if cbwe, ok := e.(*mongo.ClientBulkWriteException); ok {
+							for _, we := range cbwe.WriteErrors {
+								if we.Code == 11000 { return nil, errDuplicate }
+							}
+						}
+						return nil, e
+					}
 					status := "APPROVED"
 					if res1.MatchedCount == 0 { status = "DECLINED" }
 
