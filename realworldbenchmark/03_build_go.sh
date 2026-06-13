@@ -11,7 +11,7 @@ cd "$GO_DIR"
 
 read -r -d '' CONSTS <<'EOF' || true
 const (
-	dbName       = "fss_acid_bench"
+	dbName       = "fss_acid_proof"
 	numCards     = 1_000_000
 	numMerchants = 5_000
 	merchBuckets = 256

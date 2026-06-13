@@ -13,7 +13,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/env.sh"
 
-DB="${BENCH_DB_NAME:-fss_acid_bench}"
+DB="${BENCH_DB_NAME:-fss_acid_proof}"
 INIT_FILE="/tmp/${DB}_initial_cards.paise"
 
 if [ ! -f "$INIT_FILE" ]; then

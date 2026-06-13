@@ -20,7 +20,7 @@ export MIN_POOL="${MIN_POOL:-500}"
 export MAX_POOL="${MAX_POOL:-1000}"
 
 # ---- DB used by cash_snapshot.sh ----
-export BENCH_DB_NAME="${BENCH_DB_NAME:-fss_acid_bench}"
+export BENCH_DB_NAME="${BENCH_DB_NAME:-fss_acid_proof}"
 
 # ---- MONGO_URI required from environment (never written to disk) ----
 if [[ -z "${MONGO_URI:-}" ]]; then

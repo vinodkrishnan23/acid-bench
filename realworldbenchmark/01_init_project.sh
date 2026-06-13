@@ -11,7 +11,7 @@ echo "=== Write config.py ==="
 cat > "$SRC_DIR/config.py" <<EOF
 # RWB (Real-World Benchmark) config — rich card-management schema.
 MONGO_URI = None
-DB_NAME = "fss_acid_bench"
+DB_NAME = "fss_acid_proof"
 
 COL_CARDS     = "cards"
 COL_MERCHANTS = "merchants"

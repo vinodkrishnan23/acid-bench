@@ -6,7 +6,7 @@
 # isolates the bench's impact regardless of how much history is already in the ledger.
 set -euo pipefail
 
-DB="${BENCH_DB_NAME:-fss_acid_bench}"
+DB="${BENCH_DB_NAME:-fss_acid_proof}"
 LOADED_FILE="/tmp/${DB}_loaded_cards.paise"
 LEDGER_BASE_FILE="/tmp/${DB}_ledger_baseline.paise"
 

@@ -11,7 +11,7 @@ bandwidth, oplog volume, WiredTiger cache turnover, and network ingest in a way
 the FSS bench (few-byte docs) does not.
 
 **Nothing in `scripts/` or `terraform/` is touched.** RWB has its own database
-(`fss_acid_bench`), its own project tree (`/home/ec2-user/RWB`), and its own binaries.
+(`fss_acid_proof`), its own project tree (`/home/ec2-user/RWB`), and its own binaries.
 You can run RWB while the FSS bench is also seeded on the same cluster.
 
 ---
@@ -155,7 +155,7 @@ Same env vars as the FSS bench:
 | `MIN_POOL` / `MAX_POOL` | connection pool floor/ceiling | 500 / 1000 |
 | `WARMUP_SEC` | excluded from steady-state percentiles | 10 |
 | `BENCH_LEAN_INDEXES` | If `1`, `02_seed.sh` skips production-query secondaries on cards / merchants / ledger | unset |
-| `BENCH_DB_NAME` | DB name | `fss_acid_bench` |
+| `BENCH_DB_NAME` | DB name | `fss_acid_proof` |
 | `PROJECT_DIR` | generated tree location | `/home/ec2-user/RWB` |
 
 ---
